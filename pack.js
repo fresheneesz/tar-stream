@@ -21,20 +21,36 @@ var Sink = function(to) {
   this.written = 0
   this._to = to
   this._destroyed = false
+  this.released = false
+  this.unwritten = null
 }
 
 util.inherits(Sink, Writable)
 
 Sink.prototype._write = function(data, enc, cb) {
   this.written += data.length
-  if (this._to.push(data)) return cb()
-  this._to._drain = cb
+  if(this.released) {
+    if (this._to.push(data)) return cb()
+    this._to._drain = cb
+  } else {
+    this.unwritten = {data:data, cb:cb}
+  }
 }
 
 Sink.prototype.destroy = function() {
   if (this._destroyed) return
   this._destroyed = true
   this.emit('close')
+}
+
+// releases the sink to start writing data to the `to` destination
+Sink.prototype.release = function() {
+    this.released = true
+    if(this.unwritten !== null) {
+        if(this._to.push(this.unwritten.data)) return this.unwritten.cb()
+        this._to.drain = this.unwritten.cb()
+        this.unwritten = null
+    }
 }
 
 var Void = function() {
@@ -63,69 +79,90 @@ var Pack = function(opts) {
   this._finalizing = false
   this._destroyed = false
   this._stream = null
+  this._backOfStreamQueue = null
 }
 
 util.inherits(Pack, Readable)
 
 Pack.prototype.entry = function(header, buffer, callback) {
-  if (this._stream) throw new Error('already piping an entry')
+  //if (this._stream) throw new Error('already piping an entry')
   if (this._finalized || this._destroyed) return
-
-  if (typeof buffer === 'function') {
-    callback = buffer
-    buffer = null
-  }
-
-  if (!callback) callback = noop
-
   var self = this
-
-  if (!header.size)  header.size = 0
-  if (!header.type)  header.type = 'file'
-  if (!header.mode)  header.mode = header.type === 'directory' ? 0755 : 0644
-  if (!header.uid)   header.uid = 0
-  if (!header.gid)   header.gid = 0
-  if (!header.mtime) header.mtime = new Date()
-
-  if (typeof buffer === 'string') buffer = new Buffer(buffer)
-  if (Buffer.isBuffer(buffer)) {
-    header.size = buffer.length
-    this._encode(header)
-    this.push(buffer)
-    overflow(self, header.size)
-    process.nextTick(callback)
-    return new Void()
-  }
-  if (header.type !== 'file' && header.type !== 'contigious-file') {
-    this._encode(header)
-    process.nextTick(callback)
-    return new Void()
-  }
 
   var sink = new Sink(this)
 
-  this._encode(header)
-  this._stream = sink
+  if(this._backOfStreamQueue) {
+    eos(this._backOfStreamQueue, function(err) { // err handled in handleSink code called by previous entry method call
+        handleSink()
+    })
 
-  eos(sink, function(err) {
-    self._stream = null
+    this._backOfStreamQueue = sink
 
-    if (err) { // stream was closed
-      self.destroy()
-      return callback(err)
-    }
-
-    if (sink.written !== header.size) { // corrupting tar
-      self.destroy()
-      return callback(new Error('size mismatch'))
-    }
-
-    overflow(self, header.size)
-    if (self._finalizing) self.finalize()
-    callback()
-  })
+  } else {
+    handleSink()
+  }
 
   return sink
+
+
+  function handleSink() {
+      sink.release()
+
+      if (typeof buffer === 'function') {
+        callback = buffer
+        buffer = null
+      }
+
+      if (!callback) callback = noop
+
+
+      if (!header.size)  header.size = 0
+      if (!header.type)  header.type = 'file'
+      if (!header.mode)  header.mode = header.type === 'directory' ? 0755 : 0644
+      if (!header.uid)   header.uid = 0
+      if (!header.gid)   header.gid = 0
+      if (!header.mtime) header.mtime = new Date()
+
+      if (typeof buffer === 'string') buffer = new Buffer(buffer)
+      if (Buffer.isBuffer(buffer)) {
+        header.size = buffer.length
+        self._encode(header)
+        self.push(buffer)
+        overflow(self, header.size)
+        process.nextTick(callback)
+        return new Void()
+      }
+      if (header.type !== 'file' && header.type !== 'contigious-file') {
+        self._encode(header)
+        process.nextTick(callback)
+        return new Void()
+      }
+
+      self._encode(header)
+
+      self._stream = sink
+      if(!self._backOfStreamQueue) self._backOfStreamQueue = sink
+
+      eos(sink, function(err) {
+        if(self._backOfStreamQueue === self._stream)
+          self._backOfStreamQueue = null
+        self._stream = null
+
+        if (err) { // stream was closed
+          self.destroy()
+          return callback(err)
+        }
+
+        if (sink.written !== header.size) { // corrupting tar
+          self.destroy()
+          return callback(new Error('size mismatch'))
+        }
+
+        overflow(self, header.size)
+        if (self._finalizing && self._backOfStreamQueue === null) self.finalize()
+        callback()
+      })
+  }
 }
 
 Pack.prototype.finalize = function() {

@@ -3,6 +3,7 @@ var tar = require('../index');
 var fixtures = require('./fixtures');
 var concat = require('concat-stream');
 var fs = require('fs');
+var Stream = require("stream")
 
 test('one-file', function(t) {
 	t.plan(2);
@@ -142,3 +143,54 @@ test('unicode', function(t) {
 		t.deepEqual(data, fs.readFileSync(fixtures.UNICODE_TAR));
 	}));
 });
+//*
+test('pipe before end of last stream', function(t) {
+    t.plan(2);
+
+	var pack = tar.pack();
+
+	var sink1 = pack.entry({
+		name:'file-1.txt',
+		mtime:new Date(1387580181000),
+		mode:0644,
+		uname:'maf',
+		gname:'staff',
+		uid:501,
+		gid:20
+	});
+
+    var a = new Stream.PassThrough();
+    a.pipe(sink1);
+    a.write('i am file-1\n');
+
+	var sink2 = pack.entry({
+		name:'file-2.txt',
+		mtime:new Date(1387580181000),
+		mode:0644,
+		size:12,
+		uname:'maf',
+		gname:'staff',
+		uid:501,
+		gid:20
+	});
+
+    a.end();
+
+    var b = new Stream.PassThrough();
+    b.write('i am file-2\n');
+    b.pipe(sink2);
+
+	pack.finalize();
+    b.end();
+
+	pack.pipe(concat(function(data) {
+        console.log(data.toString())
+        console.log('vs')
+        console.log(fs.readFileSync(fixtures.MULTI_FILE_TAR).toString())
+        console.log('length: '+data.length+' vs '+fs.readFileSync(fixtures.MULTI_FILE_TAR).length)
+		t.same(data.length & 511, 0);
+		t.deepEqual(data, fs.readFileSync(fixtures.MULTI_FILE_TAR));
+	}));
+})
+//*/
+
